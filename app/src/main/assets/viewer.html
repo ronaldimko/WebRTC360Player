@@ -1,8 +1,77 @@
 <!DOCTYPE html>
 <html>
-<body style="margin:0;background:black">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { margin:0; overflow:hidden; background:black; }
+        canvas { display:block; }
+    </style>
+</head>
+<body>
 
-<h1 style="color:red">WORKING</h1>
+<canvas id="c"></canvas>
+
+<script>
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    let angleX = 0;
+    let angleY = 0;
+
+    // 👆 управление пальцем
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    canvas.addEventListener("touchstart", e => {
+        dragging = true;
+        lastX = e.touches[0].clientX;
+        lastY = e.touches[0].clientY;
+    });
+
+    canvas.addEventListener("touchmove", e => {
+        if (!dragging) return;
+
+        let dx = e.touches[0].clientX - lastX;
+        let dy = e.touches[0].clientY - lastY;
+
+        angleX += dx * 0.005;
+        angleY += dy * 0.005;
+
+        lastX = e.touches[0].clientX;
+        lastY = e.touches[0].clientY;
+    });
+
+    canvas.addEventListener("touchend", () => dragging = false);
+
+    // 👇 простая "360 имитация"
+    function draw() {
+        ctx.fillStyle = "black";
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+
+        // центр
+        let cx = canvas.width/2;
+        let cy = canvas.height/2;
+
+        // рисуем "сферу"
+        for(let i=0;i<50;i++){
+            let x = cx + Math.sin(angleX + i*0.1)*300;
+            let y = cy + Math.cos(angleY + i*0.1)*200;
+
+            ctx.fillStyle = "hsl(" + (i*10) + ",100%,50%)";
+            ctx.beginPath();
+            ctx.arc(x,y,10,0,Math.PI*2);
+            ctx.fill();
+        }
+
+        requestAnimationFrame(draw);
+    }
+
+    draw();
+</script>
 
 </body>
 </html>
