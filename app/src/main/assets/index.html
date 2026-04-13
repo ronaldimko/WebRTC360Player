@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebRTC 360 Player</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; font-family: Arial, sans-serif; }
+        #glCanvas { display: block; width: 100vw; height: 100vh; }
+
+        #ui {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 100;
+            padding: 10px;
+            background: rgba(0,0,0,0.6);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        #urlInput {
+            flex: 1;
+            padding: 6px 10px;
+            border-radius: 6px;
+            border: 1px solid #555;
+            background: #222;
+            color: #fff;
+            font-size: 13px;
+        }
+        .btn {
+            padding: 6px 14px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        #connectBtn  { background: #2196F3; color: #fff; }
+        #connectBtn:hover  { background: #1976D2; }
+        #connectBtn.connected { background: #f44336; }
+        #connectBtn.connected:hover { background: #d32f2f; }
+
+        #statusBar {
+            position: fixed;
+            bottom: 10px; left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            z-index: 100;
+            pointer-events: none;
+        }
+        .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #888; }
+        .dot.green { background: #4CAF50; }
+        .dot.red   { background: #f44336; }
+        .dot.yellow{ background: #FFC107; }
+
+        #videoEl { display: none; }
+
+        #overlay360 {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%,-50%);
+            color: rgba(255,255,255,0.15);
+            font-size: 80px;
+            font-weight: bold;
+            pointer-events: none;
+            z-index: 10;
+            letter-spacing: 6px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <input id="urlInput" type="text" placeholder="WebRTC URL (e.g. wss://your-server/offer)" value="">
+    <button class="btn" id="connectBtn">Connect</button>
+    <button class="btn" id="demoBtn" style="background:#4CAF50;color:#fff;">Demo</button>
+</div>
+
+<canvas id="glCanvas"></canvas>
+<video id="videoEl" autoplay playsinline muted></video>
+<div id="overlay360">360°</div>
+
+<div id="statusBar">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">Waiting...</span>
+</div>
+
+<script>
+// =====================================================
+//  WebGL 360° Sphere Renderer
+// =====================================================
+const canvas = document.getElementById('glCanvas');
+const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+if (!gl) {
+    document.body.innerHTML = '<p style="color:red;text-align:center;margin-top:40px">WebGL not supported</p>';
+}
+
+// Vertex shader: maps texture to sphere
+const vsSource = `
+    attribute vec3 aPosition;
+    attribute vec2 aTexCoord;
+    uniform mat4 uMVP;
+    varying vec2 vTexCoord;
+    void main() {
+        gl_Position = uMVP * vec4(aPosition, 1.0);
+        vTexCoord = aTexCoord;
+    }
+`;
+
+// Fragment shader
+const fsSource = `
+    precision mediump float;
+    varying vec2 vTexCoord;
+    uniform sampler2D uTexture;
+    void main() {
+        gl_FragColor = texture2D(uTexture, vTexCoord);
+    }
+`;
+
+function compileShader(gl, type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(sh));
+        return null;
+    }
+    return sh;
+}
+
+function createProgram(gl, vs, fs) {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        console.error(gl.getProgramInfoLog(prog));
+        return null;
+    }
+    return prog;
+}
+
+const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+const program = createProgram(gl, vs, fs);
+
+// Build sphere geometry (equirectangular inside-out sphere)
+function buildSphere(stacks, slices) {
+    const positions = [];
+    const texCoords = [];
+    const indices   = [];
+
+    for (let lat = 0; lat <= stacks; lat++) {
+        const theta = (lat / stacks) * Math.PI;
+        const sinT = Math.sin(theta);
+        const cosT = Math.cos(theta);
+
+        for (let lon = 0; lon <= slices; lon++) {
+            const phi = (lon / slices) * 2 * Math.PI;
+            const sinP = Math.sin(phi);
+            const cosP = Math.cos(phi);
+
+            const x = cosP * sinT;
+            const y = cosT;
+            const z = sinP * sinT;
+
+            positions.push(x, y, z);
+            texCoords.push(1 - lon / slices, 1 - lat / stacks);
+        }
+    }
+
+    for (let lat = 0; lat < stacks; lat++) {
+        for (let lon = 0; lon < slices; lon++) {
+            const a = lat * (slices + 1) + lon;
+            const b = a + slices + 1;
+            indices.push(a, b, a + 1);
+            indices.push(b, b + 1, a + 1);
+        }
+    }
+
+    return { positions, texCoords, indices };
+}
+
+const sphere = buildSphere(64, 64);
+
+const posBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sphere.positions), gl.STATIC_DRAW);
+
+const texBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, texBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sphere.texCoords), gl.STATIC_DRAW);
+
+const idxBuf = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(sphere.indices), gl.STATIC_DRAW);
+
+const indexCount = sphere.indices.length;
+
+// Texture
+const texture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// Placeholder color texture while no video
+const placeholderCanvas = document.createElement('canvas');
+placeholderCanvas.width  = 512;
+placeholderCanvas.height = 256;
+const pctx = placeholderCanvas.getContext('2d');
+
+function drawPlaceholder() {
+    const grad = pctx.createLinearGradient(0, 0, 0, 256);
+    grad.addColorStop(0, '#0a0a2a');
+    grad.addColorStop(1, '#1a0a0a');
+    pctx.fillStyle = grad;
+    pctx.fillRect(0, 0, 512, 256);
+
+    // Stars
+    for (let i = 0; i < 200; i++) {
+        const x = Math.random() * 512;
+        const y = Math.random() * 256;
+        const r = Math.random() * 2;
+        pctx.beginPath();
+        pctx.arc(x, y, r, 0, Math.PI * 2);
+        pctx.fillStyle = `rgba(255,255,255,${Math.random()})`;
+        pctx.fill();
+    }
+
+    pctx.fillStyle = 'rgba(255,255,255,0.5)';
+    pctx.font = 'bold 18px Arial';
+    pctx.textAlign = 'center';
+    pctx.fillText('360° WebRTC Player', 256, 120);
+    pctx.font = '13px Arial';
+    pctx.fillStyle = 'rgba(255,255,255,0.3)';
+    pctx.fillText('Connect a WebRTC stream or tap Demo', 256, 145);
+}
+drawPlaceholder();
+
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, placeholderCanvas);
+
+// Camera state
+let yaw   = 0;
+let pitch = 0;
+let hasVideo = false;
+let videoElement = document.getElementById('videoEl');
+
+// =====================================================
+//  Matrix helpers (no external lib)
+// =====================================================
+function mat4Identity() {
+    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function mat4Multiply(a, b) {
+    const out = new Float32Array(16);
+    for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 4; c++) {
+            let s = 0;
+            for (let k = 0; k < 4; k++) s += a[r*4+k] * b[k*4+c];
+            out[r*4+c] = s;
+        }
+    }
+    return out;
+}
+
+function mat4RotY(a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+}
+
+function mat4RotX(a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+}
+
+function mat4Perspective(fov, aspect, near, far) {
+    const f = 1 / Math.tan(fov / 2);
+    const nf = 1 / (near - far);
+    return new Float32Array([
+        f/aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far+near)*nf, -1,
+        0, 0, 2*far*near*nf, 0
+    ]);
+}
+
+// Attributes / uniforms
+const aPos  = gl.getAttribLocation(program, 'aPosition');
+const aTex  = gl.getAttribLocation(program, 'aTexCoord');
+const uMVP  = gl.getUniformLocation(program, 'uMVP');
+const uTex  = gl.getUniformLocation(program, 'uTexture');
+
+// Resize
+function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// =====================================================
+//  Touch / drag controls
+// =====================================================
+let touchStartX = 0, touchStartY = 0;
+let dragging = false;
+
+canvas.addEventListener('touchstart', e => {
+    if (e.touches.length === 1) {
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+        dragging = true;
+    }
+}, { passive: true });
+
+canvas.addEventListener('touchmove', e => {
+    if (dragging && e.touches.length === 1) {
+        const dx = e.touches[0].clientX - touchStartX;
+        const dy = e.touches[0].clientY - touchStartY;
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+        yaw   -= dx * 0.005;
+        pitch -= dy * 0.005;
+        pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, pitch));
+    }
+}, { passive: true });
+
+canvas.addEventListener('touchend', () => { dragging = false; });
+
+// Mouse fallback
+canvas.addEventListener('mousedown', e => {
+    touchStartX = e.clientX;
+    touchStartY = e.clientY;
+    dragging = true;
+});
+canvas.addEventListener('mousemove', e => {
+    if (dragging) {
+        yaw   -= (e.clientX - touchStartX) * 0.005;
+        pitch -= (e.clientY - touchStartY) * 0.005;
+        pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, pitch));
+        touchStartX = e.clientX;
+        touchStartY = e.clientY;
+    }
+});
+canvas.addEventListener('mouseup', () => { dragging = false; });
+
+// =====================================================
+//  Android gyroscope bridge
+// =====================================================
+window.rotateCamera = function(dy, dp) {
+    if (!dragging) {
+        yaw   += dy * 0.05;
+        pitch -= dp * 0.05;
+        pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, pitch));
+    }
+};
+
+// =====================================================
+//  WebRTC connection
+// =====================================================
+let pc = null;
+
+function setStatus(text, color) {
+    document.getElementById('statusText').textContent = text;
+    const dot = document.getElementById('statusDot');
+    dot.className = 'dot ' + (color || '');
+}
+
+async function connectWebRTC(url) {
+    if (pc) {
+        pc.close();
+        pc = null;
+        hasVideo = false;
+        document.getElementById('connectBtn').textContent = 'Connect';
+        document.getElementById('connectBtn').classList.remove('connected');
+        setStatus('Disconnected', 'red');
+        drawPlaceholder();
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, placeholderCanvas);
+        return;
+    }
+
+    setStatus('Connecting...', 'yellow');
+
+    pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.ontrack = (event) => {
+        if (event.track.kind === 'video') {
+            videoElement.srcObject = event.streams[0];
+            videoElement.play();
+            hasVideo = true;
+            setStatus('Streaming 360°', 'green');
+        }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+        const st = pc.iceConnectionState;
+        if (st === 'connected' || st === 'completed') setStatus('WebRTC Connected', 'green');
+        else if (st === 'failed' || st === 'disconnected') {
+            setStatus('Connection lost', 'red');
+            hasVideo = false;
+        }
+    };
+
+    // Add transceiver to receive video
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // Wait for ICE gathering
+        await new Promise(resolve => {
+            if (pc.iceGatheringState === 'complete') return resolve();
+            pc.addEventListener('icegatheringstatechange', () => {
+                if (pc.iceGatheringState === 'complete') resolve();
+            });
+            setTimeout(resolve, 3000); // timeout
+        });
+
+        // Send offer to server
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+        });
+
+        if (!resp.ok) throw new Error(`Server: ${resp.status}`);
+
+        const answer = await resp.json();
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+        document.getElementById('connectBtn').textContent = 'Disconnect';
+        document.getElementById('connectBtn').classList.add('connected');
+        setStatus('Connected — waiting for stream...', 'yellow');
+
+    } catch (err) {
+        console.error('WebRTC error:', err);
+        setStatus('Error: ' + err.message, 'red');
+        pc && pc.close();
+        pc = null;
+    }
+}
+
+// =====================================================
+//  Demo mode: use device camera as 360 source
+// =====================================================
+async function startDemo() {
+    try {
+        setStatus('Opening camera...', 'yellow');
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+            audio: false
+        });
+        videoElement.srcObject = stream;
+        videoElement.play();
+        hasVideo = true;
+        setStatus('Demo: Camera → 360° Sphere', 'green');
+    } catch (e) {
+        // Fallback: animated gradient
+        setStatus('Demo mode (no camera)', 'yellow');
+        startAnimatedDemo();
+    }
+}
+
+function startAnimatedDemo() {
+    let t = 0;
+    function animate() {
+        t += 0.01;
+        pctx.clearRect(0, 0, 512, 256);
+
+        const grad = pctx.createLinearGradient(0, 0, 512, 256);
+        grad.addColorStop(0, `hsl(${(t*50)%360}, 80%, 20%)`);
+        grad.addColorStop(0.5, `hsl(${(t*50+120)%360}, 80%, 30%)`);
+        grad.addColorStop(1, `hsl(${(t*50+240)%360}, 80%, 20%)`);
+        pctx.fillStyle = grad;
+        pctx.fillRect(0, 0, 512, 256);
+
+        // Moving elements
+        for (let i = 0; i < 5; i++) {
+            const x = 256 + Math.sin(t + i * 1.2) * 180;
+            const y = 128 + Math.cos(t * 0.7 + i * 0.8) * 80;
+            pctx.beginPath();
+            pctx.arc(x, y, 20 + Math.sin(t*2+i)*10, 0, Math.PI*2);
+            pctx.fillStyle = `hsla(${(t*60+i*60)%360}, 100%, 70%, 0.6)`;
+            pctx.fill();
+        }
+
+        pctx.fillStyle = 'white';
+        pctx.font = 'bold 20px Arial';
+        pctx.textAlign = 'center';
+        pctx.fillText('360° Demo — Rotate with gyro!', 256, 128);
+
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, placeholderCanvas);
+        requestAnimationFrame(animate);
+    }
+    animate();
+}
+
+// =====================================================
+//  Render loop
+// =====================================================
+function render() {
+    requestAnimationFrame(render);
+
+    // Update texture from video
+    if (hasVideo && videoElement.readyState >= videoElement.HAVE_CURRENT_DATA) {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoElement);
+    }
+
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(program);
+
+    // MVP matrix: perspective * rotY * rotX
+    const aspect = canvas.width / canvas.height;
+    const proj = mat4Perspective(Math.PI / 2.5, aspect, 0.1, 100);
+    const rotY = mat4RotY(yaw);
+    const rotX = mat4RotX(pitch);
+    const mvp  = mat4Multiply(proj, mat4Multiply(rotX, rotY));
+
+    gl.uniformMatrix4fv(uMVP, false, mvp);
+    gl.uniform1i(uTex, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, texBuf);
+    gl.enableVertexAttribArray(aTex);
+    gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+    gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);
+}
+render();
+
+// =====================================================
+//  Button handlers
+// =====================================================
+document.getElementById('connectBtn').addEventListener('click', () => {
+    const url = document.getElementById('urlInput').value.trim();
+    if (!url) { setStatus('Enter WebRTC server URL', 'red'); return; }
+    connectWebRTC(url);
+});
+
+document.getElementById('demoBtn').addEventListener('click', startDemo);
+
+setStatus('Ready — connect WebRTC or tap Demo', '');
+</script>
+</body>
+</html>
